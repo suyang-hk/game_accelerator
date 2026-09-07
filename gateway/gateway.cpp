@@ -1,19 +1,18 @@
-#include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <iterator>
 #include <netinet/in.h>
-#include <stdio.h>
-#include<random>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <unistd.h>
 #include <unordered_map>
+#include <unistd.h>
+
+#include "../common/tunnel_protocol.h"
+
 
 #define CLIENT_BIND_IP "0.0.0.0"
 #define CLIENT_PORT 8000
@@ -25,10 +24,10 @@ struct Session {
   uint32_t conv;
 
   sockaddr_in client_addr;
-  sockaddr_in server_addr;
+  sockaddr_in target_addr;
   int server_fd;
 
-  uint64_t last_alive;
+  uint64_t last_active;
 };
 
 static uint64_t now_ms() {
@@ -42,38 +41,23 @@ static bool same_addr(const sockaddr_in &a, const sockaddr_in &b) {
 }
 
 static void addr_to(char out[INET_ADDRSTRLEN], const sockaddr_in &a) {
-       inet_ntop(AF_INET, &a.sin_addr, out, INET6_ADDRSTRLEN);
-}
-
-static sockaddr_in pick_target(uint32_t) {
-  sockaddr_in t{};
-  t.sin_family = AF_INET;
-  t.sin_port = htons(SERVER_PORT);
-  inet_pton(AF_INET, SERVER_IP, &t.sin_addr);
-  return t;
-}
-
-// Mint a random 32-bit conv that does not collide with a live session.
-static uint32_t gen_conv(const std::unordered_map<uint32_t, Session>& sessions) {
-    static std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<uint32_t> dist;
-    uint32_t c;
-    do { c = dist(rng); } while (sessions.count(c));
-    return c;
+       inet_ntop(AF_INET, &a.sin_addr, out, INET_ADDRSTRLEN);
 }
 
 
 
-static Session *find_by_client(std::unordered_map<uint32_t, Session> &sessions,
-                               const sockaddr_in &client) {
-  for (auto &kv : sessions) {
-    if (same_addr(kv.second.client_addr, client)) {
-      return &kv.second;
-    }
-       }
+// // Mint a random 32-bit conv that does not collide with a live session.
+// static uint32_t gen_conv(const std::unordered_map<uint32_t, Session>& sessions) {
+//     static std::mt19937 rng{std::random_device{}()};
+//     std::uniform_int_distribution<uint32_t> dist;
+//     uint32_t c;
+//     do { c = dist(rng); } while (sessions.count(c));
+//     return c;
+// }
 
-       return nullptr;
-}
+
+
+
 
 int main() {
 // ----socket facing client
@@ -96,8 +80,11 @@ int main() {
 
   std::unordered_map<uint32_t, Session> sessions;
 
+    uint8_t pkt[BUF_SIZE];     // tunnel packet read from a client
+    uint8_t rply[BUF_SIZE];    // raw payload read back from a target
+    uint8_t resp[BUF_SIZE];    // tunnel packet built to send back to a client
 
-  char buf[BUF_SIZE];
+
   while (true) {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -115,151 +102,104 @@ int main() {
     if (FD_ISSET(client_fd, &rfds)) {
       sockaddr_in src{};
       socklen_t src_len = sizeof(src);
-      ssize_t n =
-          recvfrom(client_fd, buf, sizeof(buf), 0, (sockaddr *)&src, &src_len);
+      ssize_t n = recvfrom(client_fd, pkt,
+                           sizeof(pkt), 0, (sockaddr *)&src, &src_len);
       if (n < 0) {perror("recv(client)"); continue;}
 
-      Session *s = find_by_client(sessions, src);
-      if (s == nullptr) {
-        Session sess{};
-        sess.conv = gen_conv(sessions);
-        sess.client_addr = src;
-        sess.server_addr = pick_target(sess.conv);
-        sess.server_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sess.server_fd < 0) { perror("socket(relay)"); continue;}
-        sess.last_alive = now_ms();
-
-       auto inserted_ = sessions.emplace(sess.conv, sess);
-       s = &inserted_.first->second;
-
-       char c_ip[INET_ADDRSTRLEN], s_ip[INET6_ADDRSTRLEN];
-       addr_to(c_ip, sess.client_addr);
-       addr_to(s_ip, sess.server_addr);
-                printf("[gateway] new session conv=%u client=%s:%d -> "
-                       "target=%s:%d\n",
-                       sess.conv, c_ip, ntohs(sess.client_addr.sin_port),
-                       s_ip, ntohs(sess.server_addr.sin_port));
- 
+      uint8_t type;
+      uint32_t conv;
+      const uint8_t *data = nullptr;
+      uint16_t data_len = 0;
+      if (!tunnel::parse(pkt, (size_t)n, &type, &conv, &data, &data_len)) {
+                printf("[gateway] malformed packet (%zd bytes), dropped\n", n);
+                continue;
       }
 
-      s->last_alive = now_ms();
-      sendto(s->server_fd, buf, (size_t)n, 0, (sockaddr*)&s->server_addr, sizeof(s->server_addr));
-      char c_ip[INET_ADDRSTRLEN];
-      addr_to(c_ip, s->client_addr);
-      printf("[gateway] conv=%u client=%s:%d -> target (%zd bytes)\n",
-              s->conv, c_ip, ntohs(s->client_addr.sin_port), n);
- 
+      char src_ip[INET_ADDRSTRLEN];
+      addr_to(src_ip, src);
+
+      if (type == tunnel::PACKET_CONNECT) {
+          if (sessions.count(conv)) {
+              printf("[gateway] CONNECT conv=%u already exists, ignored\n", conv);
+              continue;
+            }
+          Session sess{};
+          sess.conv = conv;
+          sess.client_addr = src;
+          tunnel::read_connect_dst(pkt, &sess.target_addr);
+          sess.server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+          if (sess.server_fd < 0) { perror("socket(relay)"); continue; }
+          sess.last_active = now_ms();
+
+          sessions.emplace(sess.conv, sess);
+
+          char t_ip[INET_ADDRSTRLEN];
+          addr_to(t_ip, sess.target_addr);
+          printf("[gateway] CONNECT conv=%u client=%s:%d -> "
+                "target=%s:%d\n",
+                conv, src_ip, ntohs(src.sin_port),
+                t_ip, ntohs(sess.target_addr.sin_port));
+      } else if (type == tunnel::PACKET_DATA) {
+        auto it = sessions.find(conv);
+        if (it == sessions.end()) {
+          printf("[gateway] DATA for unknown conv=%u, dropped\n", conv);
+          continue;
+          }
+
+          Session &s = it->second;
+          if (!same_addr(s.client_addr, src)) {
+              printf("[gateway] DATA conv=%u from unregistered source "
+                    "%s:%d, dropped\n", conv, src_ip, ntohs(src.sin_port));
+                    continue;
+                }
+                s.last_active= now_ms();
+          sendto(s.server_fd, data, data_len, 0,
+                (sockaddr*)&s.target_addr, sizeof(s.target_addr));
+          printf("[gateway] DATA conv=%u client=%s:%d -> target "
+               "(%u bytes)\n", conv, src_ip, ntohs(src.sin_port), data_len);
+      } else if (type == tunnel::PACKET_CLOSE) {
+        auto it = sessions.find(conv);
+        if (it == sessions.end()) {
+          printf("[gateway] CLOSE for unknown conv=%u, ignored\n", conv);
+          continue;
+          }
+        Session& s = it->second;
+        if (!same_addr(s.client_addr, src)) {
+          printf("[gateway] CLOSE conv=%u from unregistered source, "
+                "ignored\n", conv);
+          continue;
+          }
+        close(s.server_fd);
+        sessions.erase(it);
+        printf("[gateway] CLOSE conv=%u session closed\n", conv);
+      } else {
+        printf("[gateway] unknown packet type %u, dropped\n", type);
+      }
+
     }
 
-    //-----server->gateway->client
     for (auto &kv : sessions) {
-      Session& s = kv.second;
+      Session &s = kv.second;
       if (!FD_ISSET(s.server_fd, &rfds)) continue;
 
       sockaddr_in from{};
       socklen_t from_len = sizeof(from);
-      ssize_t n = recvfrom(s.server_fd, buf, sizeof(buf), 0, (sockaddr*)&from, &from_len);
-       if (n < 0) {perror("recv(relay)"); continue;}
 
-       s.last_alive = now_ms();
-       sendto(client_fd, buf, (size_t)n, 0, (sockaddr*)&s.client_addr, sizeof(s.client_addr));
+      ssize_t n = recvfrom(s.server_fd, rply, sizeof(rply), 0, (sockaddr*)&from, &from_len);
+      if (n < 0) { perror("recvfrom(relay)"); continue; }
 
-       char c_ip[INET_ADDRSTRLEN];
-       addr_to(c_ip, s.client_addr);
-       printf("[gateway] conv=%u target -> client=%s:%d (%zd bytes)\n",
-              s.conv, c_ip, ntohs(s.client_addr.sin_port), n);
+      s.last_active = now_ms();
+      size_t pack_data_sz = tunnel::pack_data(resp, s.conv, rply, (uint16_t)n);
+      sendto(client_fd, resp, pack_data_sz, 0, (sockaddr*)&s.client_addr, sizeof(s.client_addr));
+      char c_ip[INET_ADDRSTRLEN];
+      addr_to(c_ip, s.client_addr);
+      printf("[gateway] reply conv=%u target -> client=%s:%d (%zd bytes)\n",
+            s.conv, c_ip, ntohs(s.client_addr.sin_port), n);
     }
-}
 
-close(client_fd);
-for (auto &kv : sessions) {
-  close(kv.second.server_fd);
-}
+  }
+  close(client_fd);
+  for (auto& kv : sessions) close(kv.second.server_fd);
 
 return 0;
-  
-#if 0
-//socket facing server
-  int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (server_fd < 0) {perror("socket(server)"); return 1;}
-
-  sockaddr_in server_addr{};
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(SERVER_PORT);
-  inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
-  printf("[gateway] real server target %s:%d\n", SERVER_IP, SERVER_PORT);
-
-  // single-client state
-  sockaddr_in client_addr{};
-  bool has_client = false;
-
-  char buf[BUF_SIZE];
-  while(true) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(client_fd, &rfds);
-    FD_SET(server_fd, &rfds);
-    int max_fd = std::max(client_fd, server_fd);
-
-    int r = select(max_fd + 1, &rfds, nullptr, nullptr, nullptr);
-    if (r < 0) {perror("select"); break;}
-
-    // client -=->server
-    if (FD_ISSET(client_fd, &rfds)) {
-      sockaddr_in src{};
-      socklen_t src_len = sizeof(src);
-      ssize_t n = recvfrom(client_fd, buf, sizeof(buf), 0, (sockaddr*)&src, &src_len);
-      if (n < 0) {perror("recvfrom(client)"); continue;}
-
-      char ip[INET_ADDRSTRLEN];
-      inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));
-
-      if (!has_client) {
-        client_addr = src;
-        has_client = true;
-        printf("[gateway] registered client %s:%d\n",
-              ip, ntohs(src.sin_port));
-      } else if (client_addr.sin_port != src.sin_port ||
-                 client_addr.sin_addr.s_addr != src.sin_addr.s_addr) {
-        // single-client only: drop packets from any other source
-        printf("[gateway] drop from unknown client %s:%d\n",
-               ip, ntohs(src.sin_port));
-        continue;
-      }
-
-      // first packet falls through here too: it must be forwarded as well
-      sendto(server_fd, buf, (size_t)n, 0, (sockaddr*)&server_addr, sizeof(server_addr));
-      printf("[gateway] %s:%d -> server (%zd bytes)\n",
-              ip, ntohs(src.sin_port), n);
-
-    }
-
-    // server --> client (only when a reply is actually ready)
-    if (FD_ISSET(server_fd, &rfds)) {
-      sockaddr_in src{};
-      socklen_t src_len = sizeof(src);
-      ssize_t n = recvfrom(server_fd, buf, sizeof(buf), 0, (sockaddr*)&src, &src_len);
-      if (n < 0) {perror("recvfrom(server)"); continue;}
-
-      if (!has_client) {
-        printf("[gateway] reply from server but no client "
-                       "registered, dropped\n");
-        continue;
-      }
-
-      sendto(client_fd, buf, (size_t)n, 0, (sockaddr*)&client_addr, sizeof(client_addr));
-      printf("[gateway] server -> %s:%d (%zd bytes)\n",
-                inet_ntoa(client_addr.sin_addr),
-                ntohs(client_addr.sin_port), n);
-    }
-  }
-
-
-
-  close(server_fd);
-  close(client_fd);
-  return 0;
-
-#endif
-
   }

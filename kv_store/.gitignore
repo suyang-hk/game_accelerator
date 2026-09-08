@@ -1,0 +1,5 @@
+# make 产物: 目标文件/依赖文件/两个可执行
+*.o
+*.d
+/kv_store
+/testcase

@@ -31,5 +31,9 @@ add_executable(gateway
     gateway/kv_client.cpp)
 target_link_libraries(gateway kcp net_utils)
 
+# 压测工具: 并发注册吞吐 / 全链路 echo 吞吐(独立,不碰主线)
+add_executable(load_test client/load_test.cpp)
+target_link_libraries(load_test kcp net_utils)
+
 # 测试用 UDP 回声服,当中继目标
 add_executable(udp_echo_server test_server/udp_echo_server.cpp)

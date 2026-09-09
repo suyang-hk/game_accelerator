@@ -33,9 +33,15 @@ int Gateway::bind_tunnel_socket() {
     close(fd);
     return -1;
   }
+  // 收包缓冲必须够大: 这是所有客户端共用的单一隧道 socket。几百个客户端同时
+  // CONNECT/发 DATA 的突发一冲,默认 ~208KB rcvbuf 就爆, 丢掉的 CONNECT 段因
+  // KCP 早已 ACK(先 input+flush 后转发)永不重传 -> 会话整窗卡死(压测实测)。
+  // 设 8MB(内核按 rmem_max 封顶,当前 4MB), 让突发被吸收而不丢包。
+  int rsz = 8 * 1024 * 1024;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rsz, sizeof(rsz));
   set_nonblock(fd);
-  printf("[gateway] ONE client socket listening on %s:%d (epoll)\n",
-         CLIENT_BIND_IP, CLIENT_PORT);
+  printf("[gateway] ONE client socket listening on %s:%d (epoll), rcvbuf=%d\n",
+         CLIENT_BIND_IP, CLIENT_PORT, rsz);
   return fd;
 }
 
@@ -76,10 +82,13 @@ bool Gateway::handle_tunnel_msg(Session *s, const uint8_t *buf, size_t n) {
     s->last_active = now_ms();
     sendto(s->target_fd, data, data_len, 0,
            (sockaddr *)&s->target_addr, sizeof(s->target_addr));
-    char c_ip[INET_ADDRSTRLEN];
-    addr_to(c_ip, s->client_addr);
-    printf("[gateway] DATA conv=%u client=%s:%d -> target (%u bytes)\n",
-           s->conv, c_ip, ntohs(s->client_addr.sin_port), data_len);
+    // 热路径逐包日志已注释(性能): 要调试转发时可取消下面注释, 但压测/高负载会巨慢
+    // if (!quiet_) {
+    //   char c_ip[INET_ADDRSTRLEN];
+    //   addr_to(c_ip, s->client_addr);
+    //   printf("[gateway] DATA conv=%u client=%s:%d -> target (%u bytes)\n",
+    //          s->conv, c_ip, ntohs(s->client_addr.sin_port), data_len);
+    // }
   } else if (type == tunnel::PACKET_CLOSE) {
     sessions_->mark_dying(s);
     printf("[gateway] CLOSE conv=%u session closed (teardown deferred)\n",
@@ -132,7 +141,8 @@ void Gateway::handle_tunnel_datagram() {
 
     uint8_t *tmsg = (uint8_t *)pool_->alloc();
     if (!tmsg) return;
-    bool gone = false;  
+    bool gone = false;
+
     while (true) {
       int got = ikcp_recv(s->kcp.kcp, (char *)tmsg, (int)MemoryPool::BLOCK);
       if (got <= 0) {
@@ -171,15 +181,18 @@ void Gateway::handle_target_reply(Session *s, int fd) {
     if (!tmsg) { pool_->free(rply); return; }
     size_t sz = tunnel::pack_data(tmsg, rply, (uint16_t)n);
     ikcp_update(s->kcp.kcp, now32());
-    ikcp_send(s->kcp.kcp, (const char *)tmsg, (int)sz);  
+    ikcp_send(s->kcp.kcp, (const char *)tmsg, (int)sz);
     ikcp_flush(s->kcp.kcp);
     pool_->free(tmsg);
     pool_->free(rply);
 
-    char c_ip[INET_ADDRSTRLEN];
-    addr_to(c_ip, s->client_addr);
-    printf("[gateway] reply conv=%u target -> client=%s:%d (%zd bytes)\n",
-           s->conv, c_ip, ntohs(s->client_addr.sin_port), n);
+    // 热路径逐包日志已注释(性能): 要调试回包时可取消下面注释
+    // if (!quiet_) {
+    //   char c_ip[INET_ADDRSTRLEN];
+    //   addr_to(c_ip, s->client_addr);
+    //   printf("[gateway] reply conv=%u target -> client=%s:%d (%zd bytes)\n",
+    //          s->conv, c_ip, ntohs(s->client_addr.sin_port), n);
+    // }
   }
 }
 
